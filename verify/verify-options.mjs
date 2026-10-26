@@ -463,11 +463,18 @@ console.log('\n[8] the settings card renders the three switches and writes them'
 // `useSyncExternalStore` each take the next slot from one cursor, so a card that
 // starts calling hooks conditionally corrupts its own state here rather than
 // silently in the settings page.
-function mountCard(snapshot) {
+function mountCard(snapshot, options = {}) {
   const states = []
   let cursor = 0
   let tree = null
   const writes = []
+  // Only collected when a test asks for the probe path: running the card's effects
+  // needs a `fetch`, a media element and timers that this stub otherwise does not
+  // have, and every existing assertion is about what the card renders WITHOUT any
+  // of that. See `runEffects`.
+  const effects = []
+  const probes = []
+  const timers = []
   const React = {
     createElement: (type, props, ...children) => ({
       type, props: props ?? {}, children: children.flat(Infinity).filter((child) => child !== null && child !== undefined),
@@ -481,10 +488,18 @@ function mountCard(snapshot) {
       }]
     },
     useCallback: (fn) => { cursor++; return fn },
-    useEffect: () => { cursor++ },
+    useEffect: (fn) => { cursor++; if (options.probe === true) effects.push(fn) },
     useSyncExternalStore: (subscribe, getSnapshot) => { cursor++; return getSnapshot() },
   }
   const doc = makeDocument()
+  if (options.probe === true) {
+    const create = doc.createElement
+    doc.createElement = (tag) => {
+      const element = create(tag)
+      if (String(tag).toLowerCase() === 'video') probes.push(element)
+      return element
+    }
+  }
   const form = {
     subscribe: () => () => {},
     getSnapshot: () => snapshot,
@@ -496,6 +511,19 @@ function mountCard(snapshot) {
     document: doc,
     location: { search: '' },
     console,
+  }
+  if (options.probe === true) {
+    // The probe's own environment: a manifest with one clip, and timers that are
+    // recorded rather than run, so the 8-second no-frame verdict is fired by the
+    // test instead of by the clock.
+    sandbox.fetch = () => Promise.resolve({
+      ok: true,
+      json: () => Promise.resolve({
+        clips: [{ name: 'clip.mp4', src: '/clip/clip.mp4', enabled: true, bytes: 1, faststart: true }],
+      }),
+    })
+    sandbox.setTimeout = (handler, ms) => { timers.push({ handler, ms }); return timers.length }
+    sandbox.clearTimeout = () => {}
   }
   vm.createContext(sandbox)
   vm.runInContext(BUNDLE, sandbox, { filename: 'lib/client.js' })
@@ -542,8 +570,32 @@ function mountCard(snapshot) {
   const refresh = () => { nodes.length = 0; collect(tree); return nodes }
 
   refresh()
+  /**
+   * Run the effects the last render registered, the way React would after a commit.
+   *
+   * Called by hand because the stub has no scheduler: the card's manifest read and
+   * its media probes are both effects, and a test that wants the probe has to run
+   * them in the same order a browser would — render, effect, promise, re-render.
+   * @returns the cleanups those effects returned.
+   */
+  const runEffects = () => {
+    const pending = effects.splice(0)
+    const cleanups = []
+    for (const fn of pending) {
+      const cleanup = fn()
+      if (typeof cleanup === 'function') cleanups.push(cleanup)
+    }
+    return cleanups
+  }
+  /** Fire every recorded timer — the probe's 8-second no-frame verdict. */
+  const fireTimers = () => {
+    const pending = timers.splice(0)
+    for (const timer of pending) timer.handler()
+    return pending.length
+  }
   return {
-    React, writes, doc, textOf, click, draw, refresh, slotKeys,
+    React, writes, doc, textOf, click, draw, refresh, slotKeys, runEffects, fireTimers,
+    probes,
     get nodes() { return nodes },
     get tree() { return tree },
   }
@@ -604,6 +656,69 @@ equal('the card asks for exactly one seat', card.slotKeys, ['settings.section'])
 check('...and it is not the Plugins list', card.slotKeys.includes('plugins.item') === false)
 check('the card renders a plain container, not a list row',
   card.tree.type === 'div', 'type=' + String(card.tree.type))
+
+// ---------------------------------------------------------------------------
+console.log('\n[10] a settled probe keeps the duration it already read')
+// ---------------------------------------------------------------------------
+// The row's first badge is the clip's length, which arrives on `loadedmetadata` —
+// before the playability verdict, which arrives on the first presented frame or on
+// the 8-second timeout. Both write into the same entry, so the later write has to
+// merge: replacing it dropped `seconds`, and every row showed `…` the moment its
+// probe finished.
+const badgeTexts = (card) => card.nodes
+  // The problem badges carry a second class (`dshba-badge warn`), so match on the
+  // class list rather than the whole attribute.
+  .filter((node) => typeof node.props.className === 'string'
+    && node.props.className.split(' ').includes('dshba-badge'))
+  .map((node) => card.textOf(node))
+
+/** Mount an open card with its effects running, and hand back its probe element. */
+async function openProbe() {
+  const card = mountCard(
+    { status: 'available', revision: 1, writable: true, value: { enabled: true, fadeMs: 2000 } },
+    { probe: true },
+  )
+  card.click(card.nodes.find((node) => node.type === 'button' && node.props.className === 'dshba-head'))
+  card.runEffects()   // the manifest read
+  await settle()
+  card.runEffects()   // the probe, now that the pool is known
+  return card
+}
+
+// A clip that presents a frame: metadata first, then the frame.
+const played = await openProbe()
+equal('the probe created one media element', played.probes.length, 1)
+played.probes[0].dispatch('loadedmetadata', {})
+played.probes[0].frameHandler()
+played.refresh()
+equal('the duration survives the played verdict', badgeTexts(played), ['8.00s'])
+
+// A clip that starts and never paints: metadata first, then the 8-second timeout.
+// The warning is ADDED — the length must not go with it.
+const wedged = await openProbe()
+wedged.probes[0].dispatch('loadedmetadata', {})
+wedged.fireTimers()
+wedged.refresh()
+equal('the duration survives the no-frame verdict', badgeTexts(wedged), ['8.00s', '一直没有画面'])
+
+// The card probes again every time it is reopened, and a verdict only describes the
+// probe that produced it. Keeping one across rounds left a warning on a clip that
+// had since played.
+const headButton = (card) => card.nodes.find((node) => node.type === 'button' && node.props.className === 'dshba-head')
+wedged.click(headButton(wedged))   // collapse
+wedged.refresh()
+wedged.runEffects()
+wedged.click(headButton(wedged))   // expand: a second round
+wedged.refresh()
+wedged.runEffects()
+wedged.refresh()
+equal('a second round starts without the previous verdict', badgeTexts(wedged), ['8.00s'])
+
+const second = wedged.probes[wedged.probes.length - 1]
+second.dispatch('loadedmetadata', {})
+second.frameHandler()
+wedged.refresh()
+equal('...and a clip that plays keeps no warning', badgeTexts(wedged), ['8.00s'])
 
 // A bundle that is not the current build of the source is the one artifact
 // failure this package cannot detect at runtime: the shell serves lib/, the
