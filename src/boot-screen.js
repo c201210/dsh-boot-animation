@@ -1169,7 +1169,12 @@
             }
             started()
           }
+          // Set once the 1200 ms window has handed the start to the muted fallback.
+          // The unmuted promise can still settle after that, and its outcome would
+          // then describe a state the element is no longer in.
+          var preempted = false
           var fallback = function () {
+            preempted = true
             setAudioBlocked('refused')
             audioRetry = function () {
               attemptPlay(false, function () {
@@ -1201,8 +1206,26 @@
           // This attempt resolved unmuted: the clip is audible, and this is the one
           // fact the button is drawn from, so it is written before the reveal
           // callback gets to say anything about the clip.
-          var unmutedPlaying = function () { settleWindow(); setAudioBlocked(null); playing() }
-          var unmutedRefused = function () { settleWindow(); fallback() }
+          //
+          // Only while it is still the attempt in charge: a resolve arriving after
+          // `fallback` has muted the element would claim the clip is audible, and
+          // `audioBlocked` is what press() reads to choose between unlocking the
+          // sound and leaving — a late write turns the two-step press into a
+          // one-step exit. `video.muted` is checked too, because the retry path and
+          // the user's own toggle write it as well.
+          var unmutedPlaying = function () {
+            settleWindow()
+            if (preempted || video.muted) return
+            setAudioBlocked(null)
+            playing()
+          }
+          // The same window, from the other side: a refusal that arrives after the
+          // fallback has run would start the muted attempt a SECOND time.
+          var unmutedRefused = function () {
+            settleWindow()
+            if (preempted) return
+            fallback()
+          }
           video.muted = false
           var played
           try {

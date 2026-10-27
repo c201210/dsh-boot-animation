@@ -144,7 +144,15 @@ class Element {
     // activation that lets the very same call through. 'refuse-always' is the
     // stubborn policy that keeps saying no — the only way to reach the refusal
     // note on the button.
+    //
+    // 'delay-unmuted' parks the unattended unmuted attempt instead: neither resolves
+    // nor rejects, which is the state the 1200 ms audio window exists for. Both
+    // halves are driven by the test, so a late arrival needs no wall time.
     const { policy, gesture } = this.activation
+    if (policy === 'delay-unmuted' && this.muted === false) {
+      this.paused = false
+      return new Promise((resolve, reject) => { this.pendingUnmuted = { resolve, reject } })
+    }
     const refused = this.muted === false
       && (policy === 'refuse-always' || (policy === 'refuse-unmuted' && !gesture))
     if (refused) {
@@ -170,6 +178,9 @@ function makeDocument(playPolicy) {
     head: make('head'),
     body: make('body'),
     documentElement: make('html'),
+    // The page's autoplay record, exposed so a test can make the browser change its
+    // mind mid-run — which is what the two-step press exists for.
+    activation,
     createElement: (tag) => make(tag),
     querySelector: (selector) => find(doc.body, selector),
     getElementById: () => null,
@@ -198,12 +209,13 @@ function mount(cfg, options = {}) {
         clips: [{ name: 'clip.mp4', src: '/clip/clip.mp4', enabled: true }],
       }),
     }),
-    // Captured, never fired: the hold window, the tail loop, the fade and the
-    // skip-advance watchdog are all wall-clock behaviour, and the assertions here
-    // are about decisions the screen makes before any of them could run.
-    setTimeout: (handler, ms) => { timers.push({ handler, ms }); return timers.length },
+    // Captured, never fired by themselves: the hold window, the tail loop, the fade
+    // and the skip-advance watchdog are all wall-clock behaviour, and the assertions
+    // here are about decisions the screen makes before any of them could run. A test
+    // that needs one of them fired does it explicitly, through `fireTimer`.
+    setTimeout: (handler, ms) => { timers.push({ handler, ms, fired: false }); return timers.length },
     clearTimeout: () => {},
-    setInterval: (handler, ms) => { timers.push({ handler, ms }); return timers.length },
+    setInterval: (handler, ms) => { timers.push({ handler, ms, fired: false }); return timers.length },
     clearInterval: () => {},
     addEventListener: () => {},
     console,
@@ -222,6 +234,23 @@ const video = (bundle) => find(bundle.doc.body, 'video')
 const overlay = (bundle) => bundle.sandbox.__DSH_BOOT_ANIM__
 const state = (bundle) => overlay(bundle).el.getAttribute('data-state')
 const press = (bundle) => video(bundle).parentNode.dispatch('pointerdown', { target: overlay(bundle).el })
+
+/**
+ * Fire the first still-pending captured timer of a given delay.
+ *
+ * `clearTimeout` is a no-op in this sandbox, so a cleared timer stays fireable; the
+ * `fired` flag is what stops one being run twice.
+ * @param bundle - the mounted screen.
+ * @param ms - the delay the timer was armed with.
+ * @returns true when a timer of that delay was still pending.
+ */
+function fireTimer(bundle, ms) {
+  const timer = bundle.timers.find((entry) => entry.ms === ms && entry.fired === false)
+  if (timer === undefined) return false
+  timer.fired = true
+  timer.handler()
+  return true
+}
 
 // ---------------------------------------------------------------------------
 console.log('\n[1] defaults: sound on, two-step press, hint shown')
@@ -344,7 +373,49 @@ const labelWrites = screenCode.match(/(?:parts\.)?sound\.textContent\s*=/g) ?? [
 equal('the sound glyph is written from one place', labelWrites.length, 2)
 
 // ---------------------------------------------------------------------------
-console.log('\n[5] showHint off: only the sentence goes')
+console.log('\n[5] a late unmuted resolve must not claim the clip is audible')
+// ---------------------------------------------------------------------------
+// The window wins when an unmuted play() neither resolves nor rejects, and the
+// fallback then mutes the element and records the refusal. The original promise can
+// still settle afterwards — writing `audioBlocked = null` there collapsed the
+// documented two-step press into a one-step exit.
+const late = mount({ sound: true }, { playPolicy: 'delay-unmuted' })
+await settle()
+equal('the unattended unmuted attempt is parked, not settled', video(late).playCalls, [false])
+check('the 1200 ms audio window is armed', fireTimer(late, 1200) === true)
+await settle()
+equal('...and the fallback starts the clip muted', video(late).playCalls, [false, true])
+equal('...recording the refusal', overlay(late).audioBlocked, 'refused')
+video(late).pendingUnmuted.resolve()
+await settle()
+equal('the late resolve leaves the refusal in place', overlay(late).audioBlocked, 'refused')
+equal('...and the element muted', video(late).muted, true)
+equal('...with the button still offering the sound',
+  find(late.doc.body, '.dshba-sound').textContent, '🔇')
+press(late)
+check('the first press still unlocks instead of entering', state(late) !== 'leaving',
+  'state=' + String(state(late)))
+equal('...by spending a play() on the retry', video(late).playCalls, [false, true, false])
+press(late)
+equal('the second press enters', state(late), 'leaving')
+
+// The same window from the other side: a refusal arriving after the fallback has run
+// must not start the muted attempt a second time — a third play().
+const lateRefusal = mount({ sound: true }, { playPolicy: 'delay-unmuted' })
+await settle()
+fireTimer(lateRefusal, 1200)
+await settle()
+equal('the fallback started the muted attempt', video(lateRefusal).playCalls, [false, true])
+video(lateRefusal).pendingUnmuted.reject(
+  Object.assign(new Error('play() failed'), { name: 'NotAllowedError' }))
+await settle()
+equal('a refusal arriving after the window does not start it again',
+  video(lateRefusal).playCalls, [false, true])
+equal('...and the recorded reason is still the window\'s',
+  overlay(lateRefusal).audioBlocked, 'refused')
+
+// ---------------------------------------------------------------------------
+console.log('\n[6] showHint off: only the sentence goes')
 // ---------------------------------------------------------------------------
 const noHint = mount({ showHint: false })
 await settle()
@@ -366,7 +437,7 @@ check('no attribute selector leaves a numeric value unquoted',
   (screenCode.match(unquotedNumeric) ?? ['none'])[0])
 
 // ---------------------------------------------------------------------------
-console.log('\n[6] the card edits exactly these three fields')
+console.log('\n[7] the card edits exactly these three fields')
 // ---------------------------------------------------------------------------
 const cardCode = CLIENT.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/[^\n]*/g, '$1')
 for (const field of ['sound', 'clickToEnter', 'showHint']) {
@@ -379,7 +450,7 @@ check('the card defaults match the Host defaults (absent means on/default)',
   && cardCode.includes("stored.showHint !== false"))
 
 // ---------------------------------------------------------------------------
-console.log('\n[7] the settings card renders the three switches and writes them')
+console.log('\n[8] the settings card renders the three switches and writes them')
 // ---------------------------------------------------------------------------
 // The card is React, and this package ships no React. But the card must be
 // reachable exactly the way the shell reaches it: evaluate `lib/client.js` in a
