@@ -500,9 +500,11 @@ function mountCard(snapshot) {
   vm.createContext(sandbox)
   vm.runInContext(BUNDLE, sandbox, { filename: 'lib/client.js' })
   const registered = []
+  /** Every slot the bundle asked the shell for, in order. */
+  const slotKeys = []
   const services = {
     slots: {
-      inject: (key, register) => register(),
+      inject: (key, register) => { slotKeys.push(key); return register() },
       register: (entry, component) => { registered.push(component); return () => {} },
     },
     locale: { register: () => {}, bind: () => (key) => key },
@@ -541,7 +543,7 @@ function mountCard(snapshot) {
 
   refresh()
   return {
-    React, writes, doc, textOf, click, draw, refresh,
+    React, writes, doc, textOf, click, draw, refresh, slotKeys,
     get nodes() { return nodes },
     get tree() { return tree },
   }
@@ -589,6 +591,19 @@ legacy.refresh()
 const legacyInputs = legacy.nodes.filter((node) => node.type === 'input')
 equal('an old settings document renders the three switches at their defaults',
   legacyInputs.slice(1).map((node) => node.props.checked), [true, false, true])
+
+// ---------------------------------------------------------------------------
+console.log('\n[9] the card occupies a settings section, not a Plugins list row')
+// ---------------------------------------------------------------------------
+// `plugins.item` feeds the Plugins page's 内置插件配置 group, which is where the
+// built-in plugins put their own configs — a third-party bundle does not belong in
+// that list, and the page that renders it is not mounted everywhere. Every
+// third-party plugin in this deployment registers into `settings.section` and
+// nothing else, so that is the only seat this card should ask for.
+equal('the card asks for exactly one seat', card.slotKeys, ['settings.section'])
+check('...and it is not the Plugins list', card.slotKeys.includes('plugins.item') === false)
+check('the card renders a plain container, not a list row',
+  card.tree.type === 'div', 'type=' + String(card.tree.type))
 
 // A bundle that is not the current build of the source is the one artifact
 // failure this package cannot detect at runtime: the shell serves lib/, the
